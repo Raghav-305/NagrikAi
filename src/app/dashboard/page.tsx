@@ -4,6 +4,7 @@ import React, { useEffect, useState } from 'react';
 import { AppLayout } from '@/components/layout/app-layout';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { DatabaseService } from '@/lib/services';
+import { cn } from '@/lib/utils';
 import { 
   Users, 
   MessageSquare, 
