@@ -3,13 +3,20 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
 import json
 import uuid
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
 from state import CRMState
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # text model
-text_llm = ChatGroq(temperature=0, model_name="llama-3.1-8b-instant")
+text_llm = ChatGroq(temperature=0, model_name="llama-3.1-8b-instant", api_key=GROQ_API_KEY)
 
 # Vision model
-vision_llm = ChatGroq(temperature=0, model_name="meta-llama/llama-4-scout-17b-16e-instruct")
+vision_llm = ChatGroq(temperature=0, model_name="meta-llama/llama-4-scout-17b-16e-instruct", api_key=GROQ_API_KEY)
 
 def get_sla(priority):
     if priority == "Critical":
@@ -24,31 +31,58 @@ def get_sla(priority):
 # Define Node Functions for each Agent (Managers)
 
 def orchestrator_node(state: CRMState):
-    """The brain that routes the complaint."""
+    """The brain that routes the complaint, and reacts to human crew updates."""
     text = state.get("citizen_report_text", "")
     location = state.get("location_data", {})
     timestamp = state.get("timestamp", "")
     
-    # Check if the Auditor kicked this back
+    # Grab the update AND the department that just did the work
+    human_update = state.get("latest_human_update", "")
+    current_dept = state.get("department_assigned", "None") 
+    
+    # Check if the Auditor kicked this back (The Rejection Loop)
     feedback = state.get("auditor_feedback", "")
     feedback_text = f"\nAUDITOR REJECTION FEEDBACK: {feedback}\nDo not route to the rejected department again!" if feedback else ""
 
+    # DYNAMIC CONTEXT: Change the prompt entirely based on the timeline phase
+    if human_update:
+        context_block = f"""
+        --- STATUS: POST-WORK REVIEW ---
+        Original Citizen Report: "{text}"
+        Department That Just Finished: "{current_dept}"
+        Human Crew Field Note: "{human_update}"
+        
+        TASK: The {current_dept} crew has completed their part of the job and left a note. 
+        Read their note to determine if ANOTHER department needs to step in to finish related repairs (e.g., repairing a road after a pipe is fixed). 
+        If another department is needed, output their node name. 
+        If the entire situation is fully resolved and no further action is needed by the city, output "END".
+        """
+    else:
+        context_block = f"""
+        --- STATUS: NEW TICKET TRIAGE ---
+        Original Citizen Report: "{text}"
+        GPS Location: "{location}"
+        Submitted Time: "{timestamp}"
+        {feedback_text}
+        
+        TASK: Analyze the raw citizen input and route it to the CORRECT Specialized Manager Agent to handle the primary issue.
+        """
+
+    # 3. The Master Prompt
     ORCHESTRATOR_PROMPT = f"""You are the 'City CRM Orchestrator Agent' (The Brain). 
-    Your responsibility is to analyze the raw citizen input (Multi-modal Text, Image Analysis, and GPS data) 
-    and route it to the CORRECT Specialized Manager Agent.
+    
+    {context_block}
 
-    Citizen Report Text: "{text}"
-    GPS Location: "{location}"
-    Submitted Time: "{timestamp}"
-    {feedback_text}
+    ROUTING OPTIONS:
+    - INFRASTRUCTURE: Roads, Bridges, Sidewalks, or Potholes.
+    - UTILITY: Water supply, Electricity leakage, Sewerage, or Power lines.
+    - PUBLIC_SAFETY: Traffic, Police emergencies, or Hazardous obstructions.
+    - ENVIRONMENT: Waste management, Garbage, Sanitation, Parks, or Trees.
+    - END: Use this ONLY if there is a 'Human Crew Field Note' stating the problem is 100% resolved.
 
-    Based on this input, decide which specialized agent needs to handle this:
-    - INFRASTRUCTURE: Use for problems with Roads, Bridges, Sidewalks, or Potholes.
-    - UTILITY: Use for problems with Water supply, Electricity leakage, Sewerage, or Power lines.
-    - PUBLIC_SAFETY: Use for problems with Traffic, Police emergencies, or Hazardous obstructions.
-    - ENVIRONMENT: Use for problems with Waste management, Garbage, Sanitation, Parks, or Trees.
-
+    CRITICAL INSTRUCTION: You must output your decision STRICTLY as a valid JSON object.
     Do not try to solve the problem yourself. Your only job is to provide the 'next_node' for routing.
+    
     You must use this exact schema:
     {{
         "next_node": "INFRASTRUCTURE"
@@ -60,10 +94,7 @@ def orchestrator_node(state: CRMState):
     
     # JSON parser
     try:
-        # 1. Strip standard markdown
         clean_text = response.content.strip().strip("```json").strip("```")
-        
-        # 2. Extract ONLY the JSON block if the LLM still added filler text
         if "{" in clean_text and "}" in clean_text:
             clean_text = clean_text[clean_text.find("{"):clean_text.rfind("}")+1]
             
@@ -93,7 +124,7 @@ def infrastructure_node(state: CRMState):
     2. Estimate the severity. If an image is provided, use it to verify the text.
     3. Draft the Action Plan for the Physical Response Crew.
     CRITICAL INSTRUCTION: You must output your analysis STRICTLY as a valid JSON object. 
-    Do not include conversational filler, introductory text like 'Here is the analysis', or markdown formatting like ```json. 
+    Do not include conversational filler. 
 
     You must use this exact schema:
     {{
@@ -105,9 +136,7 @@ def infrastructure_node(state: CRMState):
     }}
     """
 
-    # Invoke LLM
     if image_base64 and image_base64.strip() != "":
-        # MULTI-MODAL PATH
         message = HumanMessage(
             content=[
                 {"type": "text", "text": INFRASTRUCTURE_PROMPT},
@@ -117,38 +146,30 @@ def infrastructure_node(state: CRMState):
         response = vision_llm.invoke([message])
         llm_source = "Vision Tool"
     else:
-        # TEXT-ONLY PATH
         message = HumanMessage(content=INFRASTRUCTURE_PROMPT)
         response = text_llm.invoke([message])
         llm_source = "Text Tool"
 
-    # JSON parser
     try:
         clean_text = response.content.strip().strip("```json").strip("```")
         analysis_data = json.loads(clean_text)
         plan = analysis_data.get("Action_Plan", "Pending detailed assessment.")
         severity = analysis_data.get("Severity", "Moderate")
-        
-        formatted_analysis = json.dumps(analysis_data, indent=2)
-
     except json.JSONDecodeError:
-        # Fallback if the AI hallucinates bad JSON
-        formatted_analysis = f"Failed to parse JSON. Raw output: {response.content}"
+        analysis_data = {"error": f"Failed to parse JSON. Raw output: {response.content}"}
         plan = "Manual assessment required. AI failed to generate strict plan."
         severity = "Requires Triage"
 
-    # Generate the final ticket details using the AI's actual data!
     ticket_id = f"INFR-{str(uuid.uuid4())[:8]}"
     
     return {
         "messages": [response], 
-        "infrastructure_analysis": formatted_analysis,
-        "thought_process": formatted_analysis,
-        "final_department_assigned": "Roads & Bridges PWD",
-        "final_priority": f"{severity} (via {llm_source})",
+        "ai_analysis": analysis_data, # Saved as a clean dict!
+        "department_assigned": "Roads & Bridges PWD",
+        "priority": f"{severity} (via {llm_source})",
         "deadline": get_sla(severity),
-        "ticket_id": ticket_id,
-        "action_taken": plan,
+        "current_ticket_id": ticket_id,
+        "action_plan": plan,
         "next_node": "AUDITOR"
     }
 
@@ -168,7 +189,6 @@ def utility_node(state: CRMState):
     3. Draft the Action Plan for the Utility Crew.
     
     CRITICAL INSTRUCTION: You must output your analysis STRICTLY as a valid JSON object. 
-    Do not include conversational filler or markdown formatting like ```json. 
 
     You must use this exact schema:
     {{
@@ -196,9 +216,8 @@ def utility_node(state: CRMState):
         analysis_data = json.loads(clean_text)
         plan = analysis_data.get("Action_Plan", "Pending detailed utility assessment.")
         severity = analysis_data.get("Severity", "Moderate")
-        formatted_analysis = json.dumps(analysis_data, indent=2)
     except json.JSONDecodeError:
-        formatted_analysis = f"Failed to parse JSON. Raw output: {response.content}"
+        analysis_data = {"error": f"Failed to parse JSON. Raw output: {response.content}"}
         plan = "Manual assessment required. AI failed to generate strict plan."
         severity = "Requires Triage"
 
@@ -206,13 +225,12 @@ def utility_node(state: CRMState):
 
     return {
         "messages": [response],
-        "utility_analysis": formatted_analysis,
-        "thought_process": formatted_analysis,
-        "final_department_assigned": "Water & Power Board",
-        "final_priority": f"{severity} (via {llm_source})",
+        "ai_analysis": analysis_data, # Saved as a clean dict!
+        "department_assigned": "Water & Power Board",
+        "priority": f"{severity} (via {llm_source})",
         "deadline": get_sla(severity),
-        "ticket_id": ticket_id,
-        "action_taken": plan,
+        "current_ticket_id": ticket_id,
+        "action_plan": plan,
         "next_node": "AUDITOR"
     }
 
@@ -231,7 +249,6 @@ def public_safety_node(state: CRMState):
     2. Draft an emergency response plan. If an image is provided, use it to verify.
     
     CRITICAL INSTRUCTION: You must output your analysis STRICTLY as a valid JSON object. 
-    Do not include conversational filler or markdown formatting like ```json. 
 
     You must use this exact schema:
     {{
@@ -259,23 +276,21 @@ def public_safety_node(state: CRMState):
         analysis_data = json.loads(clean_text)
         plan = analysis_data.get("Action_Plan", "Pending safety patrol assessment.")
         severity = analysis_data.get("Severity", "Moderate")
-        formatted_analysis = json.dumps(analysis_data, indent=2)
     except json.JSONDecodeError:
-        formatted_analysis = f"Failed to parse JSON. Raw output: {response.content}"
+        analysis_data = {"error": f"Failed to parse JSON. Raw output: {response.content}"}
         plan = "Manual assessment required. AI failed to generate strict plan."
         severity = "Requires Triage"
 
     ticket_id = f"SAFE-{str(uuid.uuid4())[:8]}"
 
     return {
-        "messages": [response], 
-        "public_safety_analysis": formatted_analysis,
-        "thought_process": formatted_analysis,
-        "final_department_assigned": "Traffic & Public Safety",
-        "final_priority": f"{severity} (via {llm_source})",
+        "messages": [response],
+        "ai_analysis": analysis_data, # Saved as a clean dict!
+        "department_assigned": "Traffic & Public Safety",
+        "priority": f"{severity} (via {llm_source})",
         "deadline": get_sla(severity),
-        "ticket_id": ticket_id,
-        "action_taken": plan,
+        "current_ticket_id": ticket_id,
+        "action_plan": plan,
         "next_node": "AUDITOR"
     }
 
@@ -294,7 +309,6 @@ def environment_node(state: CRMState):
     2. Draft a remediation plan. If an image is provided, use it to verify.
     
     CRITICAL INSTRUCTION: You must output your analysis STRICTLY as a valid JSON object. 
-    Do not include conversational filler or markdown formatting like ```json. 
 
     You must use this exact schema:
     {{
@@ -322,34 +336,32 @@ def environment_node(state: CRMState):
         analysis_data = json.loads(clean_text)
         plan = analysis_data.get("Action_Plan", "Pending sanitation assessment.")
         severity = analysis_data.get("Severity", "Moderate")
-        formatted_analysis = json.dumps(analysis_data, indent=2)
     except json.JSONDecodeError:
-        formatted_analysis = f"Failed to parse JSON. Raw output: {response.content}"
+        analysis_data = {"error": f"Failed to parse JSON. Raw output: {response.content}"}
         plan = "Manual assessment required. AI failed to generate strict plan."
         severity = "Requires Triage"
 
     ticket_id = f"ENVR-{str(uuid.uuid4())[:8]}"
 
     return {
-        "messages": [response], 
-        "environment_analysis": formatted_analysis,
-        "thought_process": formatted_analysis,
-        "final_department_assigned": "Sanitation & Parks",
-        "final_priority": f"{severity} (via {llm_source})",
+        "messages": [response],
+        "ai_analysis": analysis_data, # Saved as a clean dict!
+        "department_assigned": "Sanitation & Parks",
+        "priority": f"{severity} (via {llm_source})",
         "deadline": get_sla(severity),
-        "ticket_id": ticket_id,
-        "action_taken": plan,
+        "current_ticket_id": ticket_id,
+        "action_plan": plan,
         "next_node": "AUDITOR"
     }
 
 # Define the Auditor Agent (Quality Control / SLA Check)
 def auditor_node(state: CRMState):
-    """Quality control check. Rejects tickets if routed to the wrong department."""
+    """Quality control check. Approves or Rejects tickets."""
     
     citizen_text = state.get("citizen_report_text", "")
-    proposed_dept = state.get("final_department_assigned", "Unknown")
-    proposed_priority = state.get("final_priority", "Unknown")
-    action_plan = state.get("action_taken", "Unknown")
+    proposed_dept = state.get("department_assigned", "Unknown")
+    proposed_priority = state.get("priority", "Unknown")
+    action_plan = state.get("action_plan", "Unknown")
     
     AUDITOR_PROMPT = f"""You are the 'City Operations Auditor' (QA Manager).
     Review the proposed ticket assignment for accuracy.
@@ -393,11 +405,23 @@ def auditor_node(state: CRMState):
             "auditor_feedback": feedback
         }
     else:
-        # If approved, we pass it through cleanly
+        # THE LEDGER APPEND: If approved, we save the finished work to history!
+        finished_ticket_record = {
+            "ticket_id": state.get("current_ticket_id"),
+            "department": proposed_dept,
+            "priority": proposed_priority,
+            "deadline": state.get("deadline"),
+            "action_plan": action_plan,
+            "ai_logic": state.get("ai_analysis"), 
+            "human_notes_that_triggered_this": state.get("latest_human_update", "Initial Report")
+        }
+        
         return {
             "messages": [response],
             "auditor_compliance_log": "APPROVED",
-            "auditor_feedback": ""
+            "auditor_feedback": "",
+            "ticket_history": [finished_ticket_record], # Appends to the permanent list
+            "next_node": END 
         }
 
 # Initialize StateGraph and Add Nodes (The Managers Layer)
@@ -457,5 +481,11 @@ workflow.add_conditional_edges(
     }
 )
 
-# Compile the expanded multi-agent graph
-crm_app = workflow.compile()
+# --- NEW: ADDING THE SQLITE MEMORY ---
+# 1. Connect to a local file called 'prototype_memory.sqlite'
+# (check_same_thread=False is needed for web servers like FastAPI)
+conn = sqlite3.connect("prototype_memory.sqlite", check_same_thread=False)
+memory = SqliteSaver(conn)
+
+# 2. Compile the expanded multi-agent graph with memory!
+crm_app = workflow.compile(checkpointer=memory)
