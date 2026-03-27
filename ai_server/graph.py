@@ -362,17 +362,34 @@ def auditor_node(state: CRMState):
     proposed_dept = state.get("department_assigned", "Unknown")
     proposed_priority = state.get("priority", "Unknown")
     action_plan = state.get("action_plan", "Unknown")
+    human_update = state.get("latest_human_update", "") # Grab the crew note!
     
+    # DYNAMIC CONTEXT: Make sure the Auditor knows the timeline!
+    if human_update:
+        context_block = f"""
+        --- STATUS: POST-WORK REVIEW ---
+        Original Complaint: "{citizen_text}"
+        LATEST FIELD CREW NOTE: "{human_update}"
+        
+        Context: The original issue was handled. You are auditing the NEXT step based purely on the FIELD CREW NOTE.
+        """
+    else:
+        context_block = f"""
+        --- STATUS: NEW TICKET TRIAGE ---
+        Original Complaint: "{citizen_text}"
+        """
+
     AUDITOR_PROMPT = f"""You are the 'City Operations Auditor' (QA Manager).
     Review the proposed ticket assignment for accuracy.
     
-    Original Citizen Complaint: "{citizen_text}"
+    {context_block}
+    
     Proposed Department: "{proposed_dept}"
     Proposed Priority: "{proposed_priority}"
     Proposed Action Plan: "{action_plan}"
     
     Rules:
-    1. Verify the department matches the physical problem (e.g., Water leaks go to Utility, not Roads).
+    1. Verify the department matches the CURRENT physical problem that needs solving.
     2. If the department is WRONG, you must REJECT the ticket. 
     
     CRITICAL INSTRUCTION: Output STRICTLY as a valid JSON object.
@@ -397,7 +414,6 @@ def auditor_node(state: CRMState):
         status = "APPROVED"
         feedback = "JSON Parse Error in Auditor."
 
-    # If rejected, we flag the log and save the feedback for the Orchestrator
     if status == "REJECTED":
         return {
             "messages": [response],
@@ -405,7 +421,7 @@ def auditor_node(state: CRMState):
             "auditor_feedback": feedback
         }
     else:
-        # THE LEDGER APPEND: If approved, we save the finished work to history!
+        # THE LEDGER APPEND
         finished_ticket_record = {
             "ticket_id": state.get("current_ticket_id"),
             "department": proposed_dept,
@@ -420,7 +436,7 @@ def auditor_node(state: CRMState):
             "messages": [response],
             "auditor_compliance_log": "APPROVED",
             "auditor_feedback": "",
-            "ticket_history": [finished_ticket_record], # Appends to the permanent list
+            "ticket_history": [finished_ticket_record], 
             "next_node": END 
         }
 
